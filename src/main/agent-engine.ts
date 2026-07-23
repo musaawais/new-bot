@@ -135,6 +135,9 @@ export class AgentEngine {
     mainWin: BrowserWindow,
     getSidebarWidth: () => number,
     getFallbackProxyRules?: () => string | null,
+    agentTabId?: string,
+    getActiveTabId?: () => string | null,
+    onTabSwitch?: (cb: (activeId: string | null) => void) => () => void,
   ): Promise<void> {
     const task = this.tasks.get(taskId);
     if (!task || task.status === 'running') return;
@@ -147,7 +150,10 @@ export class AgentEngine {
     this.emitStatus(task);
 
     try {
-      await this.runAllVisits(task, mainWin, getSidebarWidth, getFallbackProxyRules);
+      await this.runAllVisits(
+        task, mainWin, getSidebarWidth, getFallbackProxyRules,
+        agentTabId, getActiveTabId, onTabSwitch,
+      );
     } catch (err) {
       task.status = 'error';
       task.logs.push(`❌ Fatal: ${(err as Error).message}`);
@@ -167,6 +173,24 @@ export class AgentEngine {
   getAllTasks(): AgentTask[] { return Array.from(this.tasks.values()); }
   getTask(id: string): AgentTask | undefined { return this.tasks.get(id); }
 
+  /**
+   * Update a task's configuration.  Only allowed when the task is NOT running.
+   * Returns the updated task, or null if not found / currently running.
+   */
+  updateTask(taskId: string, updates: Partial<AgentTaskInput>): AgentTask | null {
+    const task = this.tasks.get(taskId);
+    if (!task || task.status === 'running') return null;
+    Object.assign(task, updates);
+    // Recalculate derived fields
+    task.totalVisits = task.visitCount * task.urls.length;
+    // Reset completion state so the updated config runs fresh
+    task.completedVisits = 0;
+    task.progress = 0;
+    task.status = 'idle';
+    this.emitStatus(task);
+    return task;
+  }
+
   // ── Visit orchestration ──────────────────────────────────────────────────
 
   private async runAllVisits(
@@ -174,6 +198,9 @@ export class AgentEngine {
     mainWin: BrowserWindow,
     getSidebarWidth: () => number,
     getFallbackProxyRules?: () => string | null,
+    agentTabId?: string,
+    getActiveTabId?: () => string | null,
+    onTabSwitch?: (cb: (activeId: string | null) => void) => () => void,
   ): Promise<void> {
     const proxies = task.proxyList.map(parseProxy).filter((p): p is ParsedProxy => p !== null);
 
@@ -199,7 +226,10 @@ export class AgentEngine {
         );
         this.emitStatus(task);
 
-        await this.runOneVisit({ task, label, targetUrl, proxy, ua, mainWin, getSidebarWidth, fallbackRules });
+        await this.runOneVisit({
+          task, label, targetUrl, proxy, ua, mainWin, getSidebarWidth, fallbackRules,
+          agentTabId, getActiveTabId, onTabSwitch,
+        });
         if (!this.isRunning(task)) return;
 
         task.completedVisits++;
@@ -229,6 +259,12 @@ export class AgentEngine {
     mainWin: BrowserWindow;
     getSidebarWidth: () => number;
     fallbackRules: string | null;
+    /** ID of the agent's virtual tab — agent view is only shown when this tab is active. */
+    agentTabId?: string;
+    /** Returns the currently active tab ID (from BrowserManager). */
+    getActiveTabId?: () => string | null;
+    /** Subscribe to tab-switch events; returns an unsubscribe function. */
+    onTabSwitch?: (cb: (activeId: string | null) => void) => () => void;
   }): Promise<void> {
     const { task, label, targetUrl, proxy, ua, mainWin, getSidebarWidth, fallbackRules } = opts;
 
@@ -238,11 +274,21 @@ export class AgentEngine {
 
     // ── 2. Apply proxy to this session ────────────────────────────────────
     if (proxy) {
-      // Embed credentials directly in the proxy URL — the most reliable method.
-      // Chromium supports http://user:pass@host:port and socks5://user:pass@host:port.
-      // This avoids the async 'login' event which can race with the first request.
+      // Embed credentials in the URL — works for most proxies.
       const proxyRules = buildProxyRules(proxy);
       try { await ses.setProxy({ proxyRules }); } catch { /* ignore */ }
+
+      // BACKUP: also handle 407 Proxy-Auth-Required via login event.
+      // Some proxy servers ignore URL-embedded credentials and still send 407.
+      if (proxy.username) {
+        ses.on('login', (_req: any, authInfo: any, callback: Function) => {
+          if (authInfo.isProxy) {
+            callback(proxy.username, proxy.password ?? '');
+          } else {
+            callback('', '');
+          }
+        });
+      }
     } else if (fallbackRules) {
       // No per-task proxy — inherit the active VPN or manual proxy
       try { await ses.setProxy({ proxyRules: fallbackRules }); } catch { /* ignore */ }
@@ -285,29 +331,91 @@ export class AgentEngine {
     });
     view.setBackgroundColor('#ffffff');
 
-    const bounds = getContentBounds(mainWin, getSidebarWidth());
-    mainWin.contentView.addChildView(view);
-    view.setBounds(bounds);
-
     const wc = view.webContents;
 
     // Set realistic user agent
     wc.setUserAgent(ua);
 
+    // ── Stealth: inject per-page JS to remove Chromium automation fingerprints
+    wc.on('dom-ready', () => {
+      if (wc.isDestroyed()) return;
+      wc.executeJavaScript(`
+        (function() {
+          // 1. Hide webdriver flag — the #1 bot-detection signal
+          try {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
+          } catch(e) {}
+
+          // 2. Add chrome object — absent in headless / automation profiles
+          if (!window.chrome) {
+            window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+          }
+
+          // 3. Realistic plugin list (empty in headless Chrome)
+          try {
+            Object.defineProperty(navigator, 'plugins', {
+              get: () => [{
+                name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer',
+                description: 'Portable Document Format', length: 1
+              }],
+              configurable: true
+            });
+          } catch(e) {}
+
+          // 4. Fix permissions API (headless returns denied for notifications)
+          try {
+            var origQuery = window.navigator.permissions.query.bind(navigator.permissions);
+            navigator.permissions.query = function(p) {
+              if (p.name === 'notifications') return Promise.resolve({ state: Notification.permission });
+              return origQuery(p);
+            };
+          } catch(e) {}
+        })();
+      `).catch(() => {});
+    });
+
+    // ── Multi-tab: only show this visit's view when the agent's tab is active ─
+    const { agentTabId, getActiveTabId, onTabSwitch } = opts;
+    const isMyTabActive = () => !agentTabId || (getActiveTabId?.() === agentTabId);
+
+    const showView = () => {
+      if (mainWin.isDestroyed()) return;
+      try {
+        mainWin.contentView.addChildView(view);
+        view.setBounds(getContentBounds(mainWin, getSidebarWidth()));
+      } catch { }
+    };
+    const hideView = () => {
+      try { mainWin.contentView.removeChildView(view); } catch { }
+    };
+
+    // Initial show/hide based on active tab
+    if (isMyTabActive()) showView(); else hideView();
+
+    // Listen for tab switches during this visit
+    let offTabSwitch: (() => void) | undefined;
+    if (onTabSwitch && agentTabId) {
+      offTabSwitch = onTabSwitch((newActiveId) => {
+        if (wc.isDestroyed()) return;
+        if (newActiveId === agentTabId) showView(); else hideView();
+      });
+    }
+
     // Re-apply bounds if window resizes during visit
     const onResize = () => {
-      if (!mainWin.isDestroyed()) {
+      if (!mainWin.isDestroyed() && isMyTabActive()) {
         try { view.setBounds(getContentBounds(mainWin, getSidebarWidth())); } catch { }
       }
     };
     mainWin.on('resize', onResize);
 
-    // Send tab-updated events to renderer so the address bar tracks the URL
+    // Send tab-updated events so the address bar tracks the URL
+    const tabUpdateId = agentTabId ?? 'agent-live';
     const sendUpdate = (url: string, title = '', loading = false) => {
       try {
         if (!mainWin.isDestroyed())
           mainWin.webContents.send('tab-updated', {
-            id: 'agent-live', url, title: title || url, favicon: '', isLoading: loading,
+            id: tabUpdateId, url, title: title || url, favicon: '', isLoading: loading,
           });
       } catch { }
     };
@@ -316,19 +424,20 @@ export class AgentEngine {
     wc.on('page-title-updated', (_, title) => sendUpdate(wc.getURL(), title, wc.isLoading()));
 
     try {
-      // ── 4. Validate proxy or fallback ─────────────────────────────────
+      // ── 4. Validate proxy — generous timeout for residential proxies ──
       if (proxy) {
         task.logs.push(`${label}: 🔌 Testing proxy ${proxy.host}:${proxy.port}...`);
         this.emitStatus(task);
-        const ok = await this.proxyWorks(wc, 5000);
-        if (!ok) {
-          task.logs.push(`${label}: ⚠️ Proxy unreachable — falling back to ${fallbackRules ? 'active VPN' : 'system network'}`);
+        // 25-second timeout — residential proxies are legitimately slow
+        const ok = await this.proxyWorks(proxy, 25_000);
+        if (ok) {
+          task.logs.push(`${label}: ✅ Proxy connected`);
           this.emitStatus(task);
-          if (fallbackRules) {
-            try { await ses.setProxy({ proxyRules: fallbackRules }); } catch { }
-          } else {
-            try { await ses.setProxy({ mode: 'system' } as any); } catch { }
-          }
+        } else {
+          // Don't fall back to real IP — skip this visit and move to next proxy
+          task.logs.push(`${label}: ⚠️ Proxy timed out — skipping this visit (next visit will use next proxy)`);
+          this.emitStatus(task);
+          return; // skip visit, don't leak real IP
         }
       }
 
@@ -349,9 +458,9 @@ export class AgentEngine {
         if (!this.isRunning(task)) return;
 
         if (await this.hasCaptcha(wc)) {
-          task.logs.push(`${label}: 🔒 CAPTCHA detected! Please solve it. Waiting 60s...`);
+          task.logs.push(`${label}: 🔒 CAPTCHA detected! Please solve it in the browser. Waiting 120s...`);
           this.emitStatus(task);
-          await this.waitForCaptchaGone(wc, task, 60_000);
+          await this.waitForCaptchaGone(wc, task, 120_000);
         }
 
         task.logs.push(`${label}: ✅ Search results loaded`);
@@ -359,7 +468,7 @@ export class AgentEngine {
         await this.sleep(800 + Math.random() * 600);
 
         const targetDomain = safeDomain(targetUrl);
-        task.logs.push(`${label}: 🖱️ Looking for "${targetDomain}" in results...`);
+        task.logs.push(`${label}: 🖱️ Scanning up to 100 results for "${targetDomain}"...`);
         this.emitStatus(task);
 
         const clicked = await this.clickSearchResult(wc, targetDomain, targetUrl);
@@ -374,44 +483,37 @@ export class AgentEngine {
         }
 
       } else if (task.keyword) {
-        task.logs.push(`${label}: 🔍 Opening Google...`);
+        // Load 100 results directly — no typing simulation (CAPTCHA risk) and
+        // enough results per page that the target site is almost always visible.
+        const searchUrl =
+          `https://www.google.com/search?q=${encodeURIComponent(task.keyword)}&num=100&hl=en`;
+        task.logs.push(`${label}: 🔍 Loading 100 Google results for "${task.keyword}"...`);
         this.emitStatus(task);
 
-        const loaded = await this.navigateTo(wc, 'https://www.google.com');
+        const loaded = await this.navigateTo(wc, searchUrl);
         if (!loaded) {
-          task.logs.push(`${label}: ❌ Could not load Google. Check proxy or internet.`);
+          task.logs.push(`${label}: ❌ Could not reach Google. Check proxy or internet.`);
           this.emitStatus(task);
           return;
         }
 
-        if (!this.isRunning(task)) return;
-        await this.sleep(800 + Math.random() * 600); // human pause before typing
-
-        // ── 6. Type keyword into Google search box ───────────────────────
-        task.logs.push(`${label}: ⌨️ Typing "${task.keyword}"...`);
-        this.emitStatus(task);
-        await this.typeIntoGoogle(wc, task.keyword);
+        await this.waitForIdle(wc, 12_000);
         if (!this.isRunning(task)) return;
 
-        // Wait for results page to fully load
-        await this.sleep(1500 + Math.random() * 1000);
-        await this.waitForIdle(wc, 10_000);
-        if (!this.isRunning(task)) return;
-
-        // ── 7. CAPTCHA check ─────────────────────────────────────────────
+        // ── 6. CAPTCHA check ─────────────────────────────────────────────
         if (await this.hasCaptcha(wc)) {
-          task.logs.push(`${label}: 🔒 CAPTCHA detected! Please solve it manually in the browser. Waiting 60s...`);
+          task.logs.push(`${label}: 🔒 CAPTCHA detected! Please solve it in the browser. Waiting 120s...`);
           this.emitStatus(task);
-          await this.waitForCaptchaGone(wc, task, 60_000);
+          await this.waitForCaptchaGone(wc, task, 120_000);
         }
 
         task.logs.push(`${label}: ✅ Google results loaded`);
         this.emitStatus(task);
-        await this.sleep(800 + Math.random() * 600); // human pause reading results
+        await this.sleep(800 + Math.random() * 600); // human reading pause
 
-        // ── 8. Try to CLICK the target URL in results (sets real Referer) ─
+        // ── 7. Scan all 100 results for target site ───────────────────────
         const targetDomain = safeDomain(targetUrl);
-        task.logs.push(`${label}: 🖱️ Finding "${targetDomain}" in search results...`);
+        task.logs.push(`${label}: 🖱️ Scanning 100 results for "${targetDomain}"...`);
         this.emitStatus(task);
 
         const clicked = await this.clickSearchResult(wc, targetDomain, targetUrl);
@@ -421,8 +523,7 @@ export class AgentEngine {
           this.emitStatus(task);
           await this.waitForIdle(wc, 20_000);
         } else {
-          // Fallback: navigate directly but inject the Google referrer
-          task.logs.push(`${label}: ↗️ Not in top results — navigating directly with Google referrer`);
+          task.logs.push(`${label}: ↗️ Not in first 100 results — navigating with Google referrer`);
           this.emitStatus(task);
           await this.navigateWithReferrer(wc, targetUrl, 'https://www.google.com/');
         }
@@ -437,9 +538,9 @@ export class AgentEngine {
 
       // ── 9. CAPTCHA check on target page ──────────────────────────────
       if (await this.hasCaptcha(wc)) {
-        task.logs.push(`${label}: 🔒 CAPTCHA on target page! Please solve it. Waiting 60s...`);
+        task.logs.push(`${label}: 🔒 CAPTCHA on target page! Please solve it in the browser. Waiting 120s...`);
         this.emitStatus(task);
-        await this.waitForCaptchaGone(wc, task, 60_000);
+        await this.waitForCaptchaGone(wc, task, 120_000);
       }
 
       task.logs.push(`${label}: 📄 Page loaded — starting real human interaction`);
@@ -462,7 +563,8 @@ export class AgentEngine {
       }
 
     } finally {
-      // ── Cleanup: remove view, unregister resize listener ──────────────
+      // ── Cleanup ───────────────────────────────────────────────────────
+      offTabSwitch?.();                          // stop listening for tab switches
       mainWin.removeListener('resize', onResize);
       try { mainWin.contentView.removeChildView(view); } catch { }
       // Don't destroy wc explicitly — Electron cleans up when view is removed
@@ -471,20 +573,54 @@ export class AgentEngine {
 
   // ── Proxy validation ──────────────────────────────────────────────────────
 
-  private proxyWorks(wc: Electron.WebContents, timeoutMs: number): Promise<boolean> {
+  /**
+   * Test proxy by opening a raw TCP socket and sending an HTTP request.
+   *
+   * Bypasses Chromium/Electron session proxy entirely — uses Node's net module.
+   * This avoids Electron 30 proxy-auth issues with isolated sessions.
+   *
+   * Flow:
+   *  1. TCP connect to proxy host:port
+   *  2. Send "GET http://ip-api.com/json HTTP/1.1" with Proxy-Authorization header
+   *  3. Any HTTP 2xx/3xx response = proxy is working
+   *  4. 407 = proxy reachable but credentials rejected
+   *  5. Timeout / connection refused = proxy unreachable
+   */
+  private proxyWorks(proxy: ParsedProxy, timeoutMs: number): Promise<boolean> {
     return new Promise((resolve) => {
-      const timer = setTimeout(() => { cleanup(); resolve(false); }, timeoutMs);
-      const onDone = () => { cleanup(); resolve(true); };
-      const onFail = (_: any, code: number) => { cleanup(); resolve(code === -3); }; // -3 = aborted (not a proxy error)
-
-      const cleanup = () => {
-        clearTimeout(timer);
-        wc.removeListener('did-finish-load', onDone);
-        wc.removeListener('did-fail-load', onFail as any);
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const net = require('net') as typeof import('net');
+      const socket = new net.Socket();
+      let settled = false;
+      const done = (ok: boolean) => {
+        if (settled) return; settled = true;
+        try { socket.destroy(); } catch { /* ignore */ }
+        resolve(ok);
       };
-      wc.once('did-finish-load', onDone);
-      wc.once('did-fail-load', onFail as any);
-      wc.loadURL('https://www.google.com').catch(() => { cleanup(); resolve(false); });
+
+      socket.setTimeout(timeoutMs);
+      socket.connect(proxy.port, proxy.host, () => {
+        // TCP connected — send a real HTTP request through the proxy
+        const creds = proxy.username
+          ? Buffer.from(`${proxy.username}:${proxy.password ?? ''}`).toString('base64')
+          : null;
+        const authLine = creds ? `Proxy-Authorization: Basic ${creds}\r\n` : '';
+        socket.write(
+          `GET http://ip-api.com/json HTTP/1.1\r\n` +
+          `Host: ip-api.com\r\n` +
+          `Connection: close\r\n` +
+          authLine +
+          `\r\n`
+        );
+        socket.once('data', (data) => {
+          const first = data.toString('utf8', 0, 50);
+          const code = parseInt((first.split(' ')[1] ?? '0'), 10);
+          // 200-399 = proxy working; 407 = proxy up but auth rejected; 0 = no HTTP response
+          done(code >= 200 && code < 400);
+        });
+      });
+      socket.on('error', () => done(false));
+      socket.on('timeout', () => done(false));
     });
   }
 
@@ -598,6 +734,7 @@ export class AgentEngine {
 
   /**
    * Find the target URL in Google search results and CLICK it.
+   * Works with Google's 100-results-per-page layout.
    * Clicking sets document.referrer = 'https://www.google.com/' naturally,
    * so GA4/GSC record it as genuine organic Google traffic.
    */
@@ -612,27 +749,43 @@ export class AgentEngine {
         (function() {
           var domain = ${JSON.stringify(targetDomain)};
           var targetUrl = ${JSON.stringify(targetUrl)};
+          var targetBare = targetUrl.replace(/^https?:\\/\\//, '').replace(/\\/$/, '');
 
-          // Google shows results in <a> tags inside #search
-          var anchors = Array.from(document.querySelectorAll('#search a[href], #rso a[href], .g a[href]'));
-          if (!anchors.length) anchors = Array.from(document.querySelectorAll('a[href]'));
+          // Build a deduped list of candidate anchors using all known Google selectors.
+          // &num=100 loads up to 100 results so they are all already in the DOM.
+          var seen = new Set();
+          var anchors = [];
+          var selectors = [
+            '#search a[href]',   // main container — covers all result types
+            '#rso a[href]',      // result snippet objects
+            '.g a[href]',        // individual result cards (classic layout)
+            '.MjjYud a[href]',   // 2024+ wrapper
+            '.yuRUbf a[href]',   // result title link (appears in many layouts)
+            'h3 a[href]',        // heading links — always the result title
+          ];
+          selectors.forEach(function(sel) {
+            try {
+              document.querySelectorAll(sel).forEach(function(a) {
+                if (!seen.has(a)) { seen.add(a); anchors.push(a); }
+              });
+            } catch(e) {}
+          });
 
+          // Match by domain or bare URL
           var match = anchors.find(function(a) {
-            var href = a.href || '';
-            return href.includes(domain) || href.includes(targetUrl.replace('https://','').replace('http://',''));
+            var href = (a.href || '').replace(/^https?:\\/\\//, '').replace(/\\/$/, '');
+            return href.includes(domain) || href === targetBare || href.startsWith(targetBare + '/');
           });
 
           if (match) {
-            // Scroll the result link into view (human behavior)
             match.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            // Small pause then click
-            setTimeout(function() { match.click(); }, 600 + Math.random() * 400);
+            setTimeout(function() { match.click(); }, 600 + Math.floor(Math.random() * 400));
             return true;
           }
           return false;
         })();
       `);
-      if (clicked) await this.sleep(700); // wait for click + navigation to start
+      if (clicked) await this.sleep(700);
       return clicked;
     } catch { return false; }
   }
@@ -832,30 +985,84 @@ function buildProxyRules(proxy: ParsedProxy): string {
  *  http://user:pass@host:port
  *  socks5://user:pass@host:port
  */
+/**
+ * Parses a single proxy line.  Supported formats:
+ *   host:port
+ *   host:port:user:pass                     ← Webshare default
+ *   user:pass@host:port                     (no protocol)
+ *   http://[user:pass@]host:port
+ *   socks5://[user:pass@]host:port
+ *   socks4://[user:pass@]host:port
+ *   host port [user] [pass]                 (space / tab separated)
+ * Lines starting with # are treated as comments and return null.
+ */
 function parseProxy(line: string): ParsedProxy | null {
   try {
     line = line.trim();
-    if (!line) return null;
+    if (!line || line.startsWith('#')) return null;
 
-    // URL format: protocol://[user:pass@]host:port
-    if (line.startsWith('http://') || line.startsWith('socks5://')) {
+    // ── Full URL with protocol prefix ─────────────────────────────────────
+    if (line.includes('://')) {
+      const isSocks = /^socks[45]:\/\//i.test(line);
       const u = new URL(line);
       return {
-        protocol: line.startsWith('socks5') ? 'socks5' : 'http',
+        protocol: isSocks ? 'socks5' : 'http',
         host: u.hostname,
-        port: parseInt(u.port) || (line.startsWith('socks5') ? 1080 : 8080),
-        username: u.username || undefined,
-        password: u.password || undefined,
+        port: parseInt(u.port) || (isSocks ? 1080 : 8080),
+        username: u.username ? decodeURIComponent(u.username) : undefined,
+        password: u.password ? decodeURIComponent(u.password) : undefined,
       };
     }
 
-    // host:port[:user:pass]
-    const parts = line.split(':');
-    if (parts.length >= 2) {
+    // ── user:pass@host:port (without protocol) ────────────────────────────
+    if (line.includes('@')) {
+      const atIdx   = line.lastIndexOf('@');
+      const creds   = line.slice(0, atIdx);
+      const hostPort = line.slice(atIdx + 1).split(':');
+      const colonIdx = creds.indexOf(':');
       return {
         protocol: 'http',
-        host: parts[0],
-        port: parseInt(parts[1]) || 8080,
+        host:     hostPort[0],
+        port:     parseInt(hostPort[1]) || 8080,
+        username: colonIdx >= 0 ? creds.slice(0, colonIdx) : creds || undefined,
+        password: colonIdx >= 0 ? creds.slice(colonIdx + 1) : undefined,
+      };
+    }
+
+    // ── Whitespace-separated: host port [user] [pass] ─────────────────────
+    if (/[ \t]/.test(line)) {
+      const parts = line.split(/\s+/);
+      return {
+        protocol: 'http',
+        host:     parts[0],
+        port:     parseInt(parts[1]) || 8080,
+        username: parts[2] || undefined,
+        password: parts[3] || undefined,
+      };
+    }
+
+    // ── Colon-separated: host:port[:user[:pass]] or user:pass:host:port ───
+    const parts = line.split(':');
+    if (parts.length >= 2) {
+      // Detect user:pass:host:port order heuristically:
+      // If part[1] is NOT a pure number (i.e. not a port), treat as password,
+      // and part[2] as host, part[3] as port.
+      const part1IsPort = /^\d+$/.test(parts[1]);
+      const part3IsPort = parts.length >= 4 && /^\d+$/.test(parts[3]);
+      if (!part1IsPort && part3IsPort) {
+        return {
+          protocol: 'http',
+          host:     parts[2],
+          port:     parseInt(parts[3]),
+          username: parts[0] || undefined,
+          password: parts[1] || undefined,
+        };
+      }
+      // Standard: host:port[:user[:pass]]
+      return {
+        protocol: 'http',
+        host:     parts[0],
+        port:     parseInt(parts[1]) || 8080,
         username: parts[2] || undefined,
         password: parts[3] || undefined,
       };
